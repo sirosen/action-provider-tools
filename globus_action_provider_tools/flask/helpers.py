@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import inspect
 import json
+import re
 from enum import Enum
 from functools import partial
-from typing import Any, Callable, Dict, Iterable, Set, Type
+from typing import Any, Callable, Dict, Iterable, Optional, Set, Type
 
+import flask
 from flask import Request, current_app, jsonify
 from jsonschema.validators import Draft7Validator
 from pydantic import BaseModel, ValidationError
@@ -11,6 +15,8 @@ from pydantic import BaseModel, ValidationError
 from globus_action_provider_tools.authentication import AuthState, TokenChecker
 from globus_action_provider_tools.data_types import (
     ActionProviderDescription,
+    ActionProviderJsonEncoder,
+    ActionProviderJSONEncoderMixin,
     ActionRequest,
     ActionStatus,
 )
@@ -97,7 +103,9 @@ def check_token(request: Request, checker: TokenChecker) -> AuthState:
     """
     Parses a Flask request to extract its bearer token.
     """
-    access_token = request.headers.get("Authorization", "").strip().lstrip("Bearer ")
+    access_token = request.headers.get("Authorization", "").strip()
+    if access_token.startswith("Bearer "):
+        access_token = access_token[len("Bearer ") :]
     auth_state = checker.check_token(access_token)
     return auth_state
 
@@ -117,7 +125,7 @@ def blueprint_error_handler(exc: Exception) -> ViewReturn:
     # Handle unexpected Exceptions in a somewhat predictable way
     resp = {
         "code": ActionProviderError.__name__,
-        "description": f"Internal Server Error",
+        "description": "Internal Server Error",
     }
     return jsonify(resp), 500
 
@@ -134,10 +142,7 @@ def validate_input(
     except ValidationError as ve:
         raise BadActionRequest(ve.errors())
 
-    try:
-        input_body_validator(action_request.body)
-    except BadActionRequest as err:
-        raise
+    input_body_validator(action_request.body)
 
     return action_request
 
@@ -201,3 +206,43 @@ def pydantic_input_validation(
         validator(**action_input)
     except ValidationError as ve:
         raise BadActionRequest(ve.errors())
+
+
+def get_flask_version(version: str = flask.__version__) -> tuple[int, ...]:
+    """Parse the Flask version into a tuple of integers.
+
+    The parsed version is used internally to avoid deprecated Flask use.
+    """
+
+    match = re.search(r"(\d+)(?:\.(\d+)(?:\.(\d+))?)?", version)
+    if match is None:
+        return ()
+
+    return tuple(int(v) for v in match.groups() if v is not None)
+
+
+if get_flask_version() >= (2, 2):
+    from flask.json.provider import DefaultJSONProvider
+
+    class JsonProvider(ActionProviderJSONEncoderMixin, DefaultJSONProvider):
+        # The ".default" method is all that is needed.
+        pass
+
+else:
+    JsonProvider: Optional["DefaultJSONProvider"] = None  # type: ignore[no-redef]
+
+
+def assign_json_provider(app_or_blueprint: flask.Flask | flask.Blueprint):
+    """Assign a JSON provider (or simply an encoder) to a Flask app or blueprint.
+
+    As of Flask 2.2.1, the `app.json_encoder` attribute is deprecated.
+    In its place, the new `app.json` attribute should be used instead.
+    This function will assign to the correct attribute
+    and avoid deprecation warnings.
+    """
+
+    if get_flask_version() >= (2, 2):
+        assert JsonProvider is not None
+        app_or_blueprint.json = JsonProvider(app_or_blueprint)
+    else:
+        app_or_blueprint.json_encoder = ActionProviderJsonEncoder
